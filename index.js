@@ -1,6 +1,6 @@
 require('dotenv').config();
-const bodyParser = require('body-parser');
 const dns = require('dns');
+const { URL } = require('url');
 const express = require('express');
 const cors = require('cors');
 const app = express();
@@ -13,8 +13,6 @@ app.use(cors());
 
 app.use('/public', express.static(`${process.cwd()}/public`));
 
-//app.use(bodyParser.urlencoded({ extended: false }));
-
 app.use(express.json()); // Middleware to parse JSON body
 
 
@@ -24,65 +22,78 @@ app.get('/', function(req, res) {
 
 
 /* db Code */
-mongoose.connect(process.env.MONGO_URI);
+mongoose.connect(process.env.MONGO_URI)
+  .catch((err) => console.error('MongoDB connection error:', err));
+mongoose.connection.on('error', (err) => console.error('MongoDB error:', err));
+
 const urlSchema = new mongoose.Schema({
   original_url: String,
   short_url: Number
 });
 const Url = mongoose.model('Url', urlSchema);
 
-// Error handler middleware
-app.post('/api/shorturl', function(req, res, next) {
-  // Chequeamos que el body tenga la propiedad url
-  if ( req.body.url == undefined || !req.body.url ) return res.json({ error: 'invalid req.body' });
-  // Chequeamos que la url sea válida
-  if ( !req.body.url.includes("http") ) return res.json({ error: 'invalid url' });
-  next();
-})
+function isValidHttpUrl(value) {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
 
-// Guardado en db de nuevo url
-app.post('/api/shorturl', async function(req, res) {
-
-  // fx auxiliar para crear random integer
+async function generateUniqueShortUrl() {
   function randomInteger(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
   }
 
-  // Generamos un número entero random para guardar en db
-  const shortUrl = randomInteger(1, 50000);
+  let shortUrl;
+  do {
+    shortUrl = randomInteger(1, 50000);
+  } while (await Url.exists({ short_url: shortUrl }));
 
-  const newUrl = new Url({ 
-    original_url: req.body.url,
-    short_url: shortUrl 
+  return shortUrl;
+}
+
+// Validation middleware
+app.post('/api/shorturl', function(req, res, next) {
+  if ( req.body.url == undefined || !req.body.url ) return res.json({ error: 'invalid req.body' });
+  if ( !isValidHttpUrl(req.body.url) ) return res.json({ error: 'invalid url' });
+  next();
+})
+
+// Save new url to db
+app.post('/api/shorturl', function(req, res) {
+  const { hostname } = new URL(req.body.url);
+
+  dns.lookup(hostname, async (err) => {
+    if (err) return res.json({ error: 'invalid url' });
+
+    const shortUrl = await generateUniqueShortUrl();
+
+    const newUrl = new Url({
+      original_url: req.body.url,
+      short_url: shortUrl
+    });
+    await newUrl.save();
+
+    res.json({
+      original_url: req.body.url,
+      short_url: shortUrl
+    });
   });
-  // Guardamos un nuevo documento en la colección
-  await newUrl.save();
-
-  // Contestamos
-  res.json({ 
-    original_url: req.body.url, 
-    short_url: shortUrl
-  });
-
 });
 
 // GET dynamic endpoint
-app.get('/api/shorturl/:shortUrlNumber', async (req, res, next) => {
+app.get('/api/shorturl/:shortUrlNumber', function(req, res, next) {
 
-    // Verificamos primero que el parámetro sea válido
     if ( req.params.shortUrlNumber == undefined || !req.params.shortUrlNumber ) return res.json({ error: 'invalid url' });
     next();
 
   }, async (req, res) => {
 
-  // Buscamos en la db la url que corresponde con el parámetro que llegó 
-  const query = Url.where({ short_url: req.params.shortUrlNumber });
-  const getUrl = await query.findOne();
+  const getUrl = await Url.findOne({ short_url: req.params.shortUrlNumber });
 
-  // Si no la encontramos contestamos error
   if ( !getUrl ) return res.json({ error: 'invalid url' });
 
-  // Redirigimos
   res.writeHead(301, {
     Location: getUrl.original_url
   }).end();
